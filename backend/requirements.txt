@@ -21,3 +21,5 @@ pymysql
 bcrypt
 python-jose[cryptography]
 slowapi
+redis
+fastmcp

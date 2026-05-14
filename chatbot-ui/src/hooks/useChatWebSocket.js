@@ -76,13 +76,17 @@ export const useChatWebSocket = (url, sessionId, userPrefix = 'guest', isActive 
 
         socket.onclose = () => {
             setIsConnected(false);
+            setIsTyping(false); // Clear processing state on disconnect
             // Auto-reconnect only if this socket is still the current one
             if (socketRef.current === socket && sessionId) {
                 reconnectTimeoutRef.current = setTimeout(() => connect(), 3000);
             }
         };
 
-        socket.onerror = (err) => console.error('[WS] Error:', err);
+        socket.onerror = (err) => {
+            console.error('[WS] Error:', err);
+            setIsTyping(false); // Clear processing state on error
+        };
 
         socket.onmessage = (event) => {
             if (socketRef.current !== socket) return;
@@ -162,6 +166,11 @@ export const useChatWebSocket = (url, sessionId, userPrefix = 'guest', isActive 
                     break;
                 }
 
+                case 'response.complete': {
+                    setIsTyping(false);
+                    break;
+                }
+
                 case 'session.end': {
                     setIsSessionEnd(true);
                     setIsTyping(false);
@@ -182,14 +191,31 @@ export const useChatWebSocket = (url, sessionId, userPrefix = 'guest', isActive 
         };
     }, [url, sessionId, userPrefix, isGuest, isActive]);
 
-    // Notify server of active state
+    // Heartbeat to keep connection alive and sync visibility
+    useEffect(() => {
+        if (!isConnected || !socketRef.current) return;
+
+        const heartbeatInterval = setInterval(() => {
+            if (socketRef.current?.readyState === WebSocket.OPEN) {
+                socketRef.current.send(JSON.stringify({ 
+                    type: "heartbeat", 
+                    background: document.hidden 
+                }));
+            }
+        }, 30000); // 30 seconds
+
+        return () => clearInterval(heartbeatInterval);
+    }, [isConnected, isActive]);
+
+    // Also notify on visibility/active state change
     useEffect(() => {
         if (socketRef.current?.readyState === WebSocket.OPEN) {
             socketRef.current.send(JSON.stringify({ 
-                type: 'visibility', 
-                is_active: isActive && !document.hidden 
+                type: "heartbeat", 
+                background: document.hidden 
             }));
         }
+        if (!isActive) setIsTyping(false);
     }, [isActive, isConnected]);
 
     // Connect (with a small debounce to handle React Strict Mode double-mount)
@@ -237,6 +263,12 @@ export const useChatWebSocket = (url, sessionId, userPrefix = 'guest', isActive 
             socketRef.current.send(JSON.stringify({ type: 'user_typing' }));
     };
 
+    const reportActivity = useCallback(() => {
+        if (socketRef.current?.readyState === WebSocket.OPEN) {
+            socketRef.current.send(JSON.stringify({ type: 'activity' }));
+        }
+    }, []);
+
     return {
         isConnected,
         messages,
@@ -249,5 +281,6 @@ export const useChatWebSocket = (url, sessionId, userPrefix = 'guest', isActive 
         sendAudioChunk,
         sendTranscribeRequest,
         sendTypingIndicator,
+        reportActivity,
     };
 };

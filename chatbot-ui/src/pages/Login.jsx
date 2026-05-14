@@ -1,8 +1,10 @@
+/* eslint-disable no-unused-vars */
 import React, { useState } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { LogIn, UserPlus, UserCircle, Shield, ArrowRight, Loader2, Eye, EyeOff } from 'lucide-react';
 import clsx from 'clsx';
+import { api } from '../services/api';
 
 const Login = () => {
     // Initial mode from localStorage or default to 'login'
@@ -88,11 +90,7 @@ const Login = () => {
         }
 
         try {
-            const response = await fetch(`http://localhost:8000/api/auth/${endpoint}`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(body)
-            });
+            const response = await api.post(`/api/auth/${endpoint}`, body);
 
             const data = await response.json();
 
@@ -117,7 +115,7 @@ const Login = () => {
     const handleGuestLogin = async () => {
         setLoading(true);
         try {
-            const response = await fetch('http://localhost:8000/api/auth/guest', { method: 'POST' });
+            const response = await api.post('/api/auth/guest', {});
             const data = await response.json();
             if (response.ok) {
                 login(data.access_token, data.user);
@@ -170,7 +168,7 @@ const Login = () => {
                                     value={formData.displayName}
                                     onChange={handleInputChange}
                                     placeholder="Enter your full name"
-                                    className="w-full bg-slate-900/50 border border-white/10 rounded-xl px-4 py-3 text-white placeholder:text-slate-600 focus:outline-none focus:border-indigo-500/50 focus:ring-1 focus:ring-indigo-500/50 transition-all"
+                                    className="w-full bg-slate-900/50 border border-white/10 rounded-xl px-4 py-3 text-base text-white placeholder:text-slate-600 focus:outline-none focus:border-indigo-500/50 focus:ring-1 focus:ring-indigo-500/50 transition-all"
                                     required
                                 />
                             </div>
@@ -186,7 +184,7 @@ const Login = () => {
                                 value={formData.email}
                                 onChange={handleInputChange}
                                 placeholder="name@example.com"
-                                className="w-full bg-slate-900/50 border border-white/10 rounded-xl px-4 py-3 text-white placeholder:text-slate-600 focus:outline-none focus:border-indigo-500/50 focus:ring-1 focus:ring-indigo-500/50 transition-all"
+                                className="w-full bg-slate-900/50 border border-white/10 rounded-xl px-4 py-3 text-base text-white placeholder:text-slate-600 focus:outline-none focus:border-indigo-500/50 focus:ring-1 focus:ring-indigo-500/50 transition-all"
                                 required
                             />
                         </div>
@@ -202,7 +200,7 @@ const Login = () => {
                                     value={formData.password}
                                     onChange={handleInputChange}
                                     placeholder="••••••••"
-                                    className="w-full bg-slate-900/50 border border-white/10 rounded-xl px-4 py-3 text-white placeholder:text-slate-600 focus:outline-none focus:border-indigo-500/50 focus:ring-1 focus:ring-indigo-500/50 transition-all pr-12"
+                                    className="w-full bg-slate-900/50 border border-white/10 rounded-xl px-4 py-3 text-base text-white placeholder:text-slate-600 focus:outline-none focus:border-indigo-500/50 focus:ring-1 focus:ring-indigo-500/50 transition-all pr-12"
                                     required
                                 />
                                 <button

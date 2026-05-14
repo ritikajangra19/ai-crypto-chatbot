@@ -27,10 +27,13 @@ import google.genai as genai
 
 # Import agent and RAG service
 from agent import root_agent
-import rag_service
+try:
+    import rag_service
+except ImportError:
+    from . import rag_service
 
 # Import DB and Auth
-from database import get_db, User, AdminUser, ChatSession, ChatMessage, DefaultQuestion, Document
+from database import get_db, SessionLocal, User, AdminUser, ChatSession, ChatMessage, DefaultQuestion, Document
 from auth import get_password_hash, verify_password, create_access_token, get_current_user, get_current_admin, limiter
 
 # Import Gemini error types for smart retry logic
@@ -38,6 +41,8 @@ try:
     from google.genai.errors import ServerError as GeminiServerError
 except ImportError:
     GeminiServerError = None
+
+from services.observability import metrics
 
 # Initialize Professional Logging
 logging.basicConfig(
@@ -84,30 +89,62 @@ def sync_rag_documents(db: Session):
 load_dotenv()
 
 # Add FFmpeg to PATH (required for webm -> wav conversion)
-ffmpeg_path = r"C:\Users\rites\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.0.1-full_build\bin"
-if os.path.exists(ffmpeg_path):
-    os.environ["PATH"] += os.pathsep + ffmpeg_path
+# Portability: Check env for custom path, otherwise try your local default
+ffmpeg_path = os.getenv("FFMPEG_BIN_PATH")
+
+if ffmpeg_path and os.path.exists(ffmpeg_path):
+    if os.path.isdir(ffmpeg_path):
+        # If it's a directory, add to PATH and look for ffmpeg.exe inside
+        os.environ["PATH"] += os.pathsep + ffmpeg_path
+        FFMPEG_BIN = os.path.join(ffmpeg_path, "ffmpeg.exe")
+        if not os.path.exists(FFMPEG_BIN):
+             FFMPEG_BIN = "ffmpeg" # Fallback to path lookup
+    else:
+        # If it's a direct path to the exe
+        FFMPEG_BIN = ffmpeg_path
+else:
+    FFMPEG_BIN = "ffmpeg" # relies on system PATH
 
 # --- Whisper.cpp Configuration ---
-WHISPER_DIR = os.path.join(os.path.dirname(__file__), "whisper-cli", "whisper-cublas-12.4.0-bin-x64", "Release")
-WHISPER_EXE = os.path.join(WHISPER_DIR, "whisper-cli.exe")
-WHISPER_MODEL = os.path.join(WHISPER_DIR, "ggml-base.en.bin")
+# Portability: Use environment variables or relative paths
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Default structure from latest main
+DEFAULT_WHISPER_EXE = os.path.join(BASE_DIR, "whisper.cpp", "build", "bin", "whisper-cli")
+DEFAULT_WHISPER_MODEL = os.path.join(BASE_DIR, "whisper.cpp", "models", "ggml-base.en.bin")
+
+# Use ENV if available, otherwise use defaults
+WHISPER_EXE = os.getenv("WHISPER_EXE_PATH", DEFAULT_WHISPER_EXE)
+WHISPER_MODEL = os.getenv("WHISPER_MODEL_PATH", DEFAULT_WHISPER_MODEL)
+WHISPER_DIR = os.path.dirname(WHISPER_EXE)
+
+logger.info(f"Whisper EXE: {WHISPER_EXE}")
+logger.info(f"Whisper Model: {WHISPER_MODEL}")
 
 if os.path.exists(WHISPER_EXE):
-    logger.info(f"whisper-cli.exe found: {WHISPER_EXE}")
+    logger.info(f"whisper-cli executable found: {WHISPER_EXE}")
 else:
-    logger.warning(f"whisper-cli.exe NOT found at: {WHISPER_EXE}")
+    logger.warning(f"whisper-cli NOT found at: {WHISPER_EXE}. Voice transcription may fail if not configured in .env")
 
 app = FastAPI(title="CryptoAI Backend")
 
 # Enable CORS for frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "*"],
+    allow_origins=["http://localhost:3000", "https://ai-smart-trading-bot-j6ry.vercel.app",
+    "https://ai-smart-trading-bot.vercel.app", "*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.middleware("http")
+async def add_process_time_header(request: Request, call_next):
+    start_time = time.perf_counter()
+    response = await call_next(request)
+    process_time = (time.perf_counter() - start_time) * 1000
+    metrics.record_latency("api_request", process_time)
+    return response
 
 # Apply Rate Limiter
 app.state.limiter = limiter
@@ -166,6 +203,7 @@ def register(request: Request, data: RegisterRequest, db: Session = Depends(get_
         username=data.username,
         password_hash=get_password_hash(data.password),
         display_name=data.display_name or data.username,
+        role="user",
         is_guest=False
     )
     db.add(user)
@@ -240,7 +278,7 @@ def list_sessions(current_user: User = Depends(get_current_user), db: Session = 
         "last_message_at": s.last_message_at.replace(tzinfo=timezone.utc).timestamp() * 1000 if s.last_message_at else 0,
         "is_ended": (
             s.last_message_at is not None and 
-            (now - s.last_message_at.replace(tzinfo=timezone.utc)).total_seconds() >= 300
+            (now - s.last_message_at.replace(tzinfo=timezone.utc)).total_seconds() >= 600
         )
     } for s in sessions]
 
@@ -282,7 +320,9 @@ async def transcribe_with_whisper(webm_bytes: bytes) -> str:
 
         # 2. Convert webm → 16kHz mono WAV using ffmpeg (required by whisper.cpp)
         ffmpeg_cmd = [
-            "ffmpeg", "-y",
+            # "ffmpeg",
+            FFMPEG_BIN, 
+            "-y",
             "-i", temp_webm,
             "-ar", "16000",    # 16kHz sample rate
             "-ac", "1",        # Mono channel
@@ -416,6 +456,59 @@ async def generate_ai_followup(last_bot_message: str) -> str:
         logger.warning(f"AI follow-up generation failed: {e}")
         return ""
 
+async def prime_adk_session_from_db(session_id: str, user_id_ai: str):
+    """
+    Loads last 30 messages from MySQL and injects them into the ADK SessionService
+    if the runtime session is currently empty. Ensures AI memory survives restarts.
+    """
+    session = await session_service.get_session(
+        app_name="CryptoBackend", user_id=user_id_ai, session_id=session_id
+    )
+    
+    # If session already has messages in RAM, don't re-prime (prevents duplicates)
+    # if session and hasattr(session, 'history') and len(session.history) > 0:
+    #     return 
+    if session and (
+        (hasattr(session, 'history') and len(session.history) > 0) or
+        (hasattr(session, 'events') and len(session.events) > 0)
+    ):
+        return
+    
+    db = SessionLocal()
+    try:
+        # Fetch last 30 messages to provide deep context without token explosion
+        history = db.query(ChatMessage).filter(ChatMessage.session_id == session_id).order_by(ChatMessage.created_at.desc()).limit(30).all()
+        history.reverse() # Order chronologically
+        
+        if not history:
+            return
+            
+        adk_messages = []
+        for msg in history:
+            # Map DB roles to Gemini/ADK expected roles
+            role = "user" if msg.role == "user" else "model"
+            content = types.Content(role=role, parts=[types.Part(text=msg.content)])
+            adk_messages.append(content)
+            
+        if not session:
+            await session_service.create_session(
+                app_name="CryptoBackend", user_id=user_id_ai, session_id=session_id
+            )
+            session = await session_service.get_session(
+                app_name="CryptoBackend", user_id=user_id_ai, session_id=session_id
+            )
+            
+        if session:
+            # session.history = adk_messages
+            if hasattr(session, 'history'):
+                session.history = adk_messages
+            elif hasattr(session, 'events'):
+                session.events = adk_messages
+            logger.info(f"✅ Primed ADK session {session_id} with {len(adk_messages)} messages from DB")
+    except Exception as e:
+        logger.error(f"❌ Failed to prime session {session_id}: {e}")
+    finally:
+        db.close()
 
 @app.websocket("/ws/chat/{client_id}")
 async def websocket_endpoint(websocket: WebSocket, client_id: str, token: Optional[str] = None):
@@ -453,6 +546,10 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str, token: Option
     
     logger.info(f"Client {client_id} connected (User: {user_id_for_ai})")
 
+    # --- Session Recovery & Priming ---
+    # Rehydrate AI memory from DB before processing any new messages
+    await prime_adk_session_from_db(client_id, user_id_for_ai)
+
     # Audio buffer: accumulates raw webm bytes from MediaRecorder chunks
     audio_buffer = bytearray()
 
@@ -470,7 +567,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str, token: Option
     async def cold_start_routine():
         """If user opens chat but doesn't type for 15s, send exactly ONE nudge if session is empty."""
         try:
-            await asyncio.sleep(15)
+            await asyncio.sleep(60)
             # Only send if no interaction, no session end, and 0 nudges sent so far
             if not interaction_started and not session_ended and is_client_active:
                 db = SessionLocal()
@@ -501,6 +598,16 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str, token: Option
                         session_obj.last_message_at = datetime.now(timezone.utc)
                         db.commit()
                     
+                    # Sync with ADK In-Memory Session
+                    session = await session_service.get_session(app_name="CryptoBackend", user_id=user_id_for_ai, session_id=client_id)
+                    if not session:
+                        await session_service.create_session(app_name="CryptoBackend", user_id=user_id_for_ai, session_id=client_id)
+                        session = await session_service.get_session(app_name="CryptoBackend", user_id=user_id_for_ai, session_id=client_id)
+                    
+                    if session and hasattr(session, 'history'):
+                        session.history.append(types.Content(role="model", parts=[types.Part(text=msg)]))
+                        logger.info(f"Synced cold start nudge to ADK session {client_id}")
+
                     logger.info(f"Persistent Cold Start nudge sent to {client_id}")
                 db.close()
         except asyncio.CancelledError:
@@ -529,17 +636,14 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str, token: Option
                     count = guest_nudge_count
 
                 # --- Dynamic Idle Check ---
-                # Only send if:
-                # 1. Chat is actively open (is_client_active)
-                # 2. User is not currently typing (last 10s)
-                # 3. User has been idle for at least 80s since last activity
+                # Only skip if the user is actively typing right now (last 10s)
+                # We no longer care if the tab is 'active' or 'hidden' - if they are idle, nudge them.
                 current_time = time.time()
-                is_idle = (current_time - last_activity_time) >= 80
+                is_idle = (current_time - last_activity_time) >= 90
                 is_typing_now = (current_time - last_typing_time) < 10
 
-                if not is_client_active or is_typing_now or not is_idle:
-                    logger.info(f"Nudge skipped for {client_id}: active={is_client_active}, typing={is_typing_now}, idle={is_idle}")
-                    # Re-queue the loop if we want to try again, but let's just skip this slot
+                if is_typing_now or not is_idle:
+                    logger.info(f"Nudge postponed for {client_id}: typing={is_typing_now}, idle_timer_met={is_idle}")
                     continue
 
                 if count >= 2: 
@@ -567,6 +671,16 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str, token: Option
                     db.commit()
                 else:
                     guest_nudge_count += 1
+                
+                # Sync with ADK In-Memory Session
+                session = await session_service.get_session(app_name="CryptoBackend", user_id=user_id_for_ai, session_id=client_id)
+                if not session:
+                    await session_service.create_session(app_name="CryptoBackend", user_id=user_id_for_ai, session_id=client_id)
+                    session = await session_service.get_session(app_name="CryptoBackend", user_id=user_id_for_ai, session_id=client_id)
+                
+                if session and hasattr(session, 'history'):
+                    session.history.append(types.Content(role="model", parts=[types.Part(text=msg)]))
+                    logger.info(f"Synced follow-up nudge to ADK session {client_id}")
                     
                 db.close()
                 logger.info(f"Follow-up nudge sent to {client_id}")
@@ -581,7 +695,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str, token: Option
                 await asyncio.sleep(10)
                 if session_ended: return
                 elapsed = time.time() - last_activity_time
-                if elapsed >= 300:  # 5 minutes
+                if elapsed >= 600:  # 10 minutes
                     logger.info(f"Hard timeout reached for {client_id} ({elapsed:.0f}s idle)")
                     session_ended = True
                     try:
@@ -630,7 +744,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str, token: Option
     # --- Check for 5-minute Timeout (Persistent) ---
     if session_obj and session_obj.last_message_at:
         elapsed = (datetime.now(timezone.utc) - session_obj.last_message_at.replace(tzinfo=timezone.utc)).total_seconds()
-        if elapsed >= 300:
+        if elapsed >= 600:
             logger.info(f"Session {client_id} resumed but is already timed out ({elapsed:.0f}s). Locking.")
             session_ended = True
             await websocket.send_json({"type": "session.end"})
@@ -657,7 +771,14 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str, token: Option
     db.close()
 
     existing_session = await session_service.get_session(app_name="CryptoBackend", user_id=user_id_for_ai, session_id=client_id)
-    history_found = existing_session and hasattr(existing_session, 'messages') and len(existing_session.messages) > 0
+    # history_found = (existing_session and hasattr(existing_session, 'history') and len(existing_session.history) > 0)
+
+    history_found = (
+        existing_session and (
+            (hasattr(existing_session, 'history') and len(existing_session.history) > 0) or
+            (hasattr(existing_session, 'events') and len(existing_session.events) > 0)
+        )
+    )
 
     if history_found:
         interaction_started = True
@@ -665,9 +786,19 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str, token: Option
         
         # Look for the last bot message to provide context for potential follow-up resume
         last_bot_msg = ""
-        for m in reversed(existing_session.messages):
-            if m.role == "model":
-                for p in m.parts:
+        session_history = (
+            existing_session.history if hasattr(existing_session, 'history') 
+            else existing_session.events if hasattr(existing_session, 'events') 
+            else []
+        )
+        for m in reversed(session_history):
+            # ADK Event object uses 'author' not 'role'
+            m_role = getattr(m, 'role', None) or getattr(m, 'author', None)
+            if m_role == "model":
+                parts = getattr(m, 'parts', [])
+                if not parts and hasattr(m, 'content'):
+                    parts = getattr(m.content, 'parts', [])
+                for p in parts:
                     if hasattr(p, 'text') and p.text:
                         last_bot_msg = p.text
                         break
@@ -692,8 +823,18 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str, token: Option
         while True:
             message = await websocket.receive()
 
-            # Update activity timestamp on any message
-            last_activity_time = time.time()
+            if "text" in message:
+                data = json.loads(message["text"])
+                msg_type = data.get("type")
+                
+                # Reset inactivity timer for any REAL interaction, but ignore automated heartbeats
+                if msg_type != "heartbeat":
+                    last_activity_time = time.time()
+                
+                if msg_type == "user_typing":
+                    last_typing_time = time.time()
+                    # Skip further processing for typing indicator
+                    continue
 
             if "bytes" in message and message["bytes"]:
                 cancel_followup()
@@ -725,9 +866,18 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str, token: Option
                         "is_dictation": True
                     })
 
+                elif msg_type == "visibility" or msg_type == "activity":
+                    # Activity heartbeat to prevent timeout
+                    # We do NOT cancel followups here, because these are background heartbeats.
+                    # Interaction only counts if the user actually types or speaks.
+                    if msg_type == "visibility":
+                         is_client_active = data.get("is_active", False)
+                    continue
+
                 elif msg_type == "user_typing":
-                    cancel_followup()
-                    cancel_cold_start()
+                    # Update typing timestamp but DO NOT cancel the follow-up task.
+                    # The follow-up loop will see this timestamp and wait.
+                    last_typing_time = time.time()
                     interaction_started = True
                     continue
 
@@ -783,10 +933,15 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str, token: Option
                         for attempt in range(1, max_retries + 1):
                             try:
                                 logger.info(f"Running agent for {client_id} (attempt {attempt})...")
+                                # Inject structured [SYSTEM CONTEXT] for deterministic identity in tool calls
+                                # This is internal-only and won't be visible to the user in the UI
+                                context_prefix = f"[SYSTEM CONTEXT: user_id={db_user_id}, session_id={client_id}]\n"
+                                
+                                llm_start = time.perf_counter()
                                 async for event in runner.run_async(
                                     user_id=user_id_for_ai,
                                     session_id=client_id,
-                                    new_message=types.Content(role="user", parts=[types.Part(text=user_text)])
+                                    new_message=types.Content(role="user", parts=[types.Part(text=f"{context_prefix}{user_text}")])
                                 ):
                                     chunk_text = ""
                                     if hasattr(event, 'text') and event.text:
@@ -803,11 +958,15 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str, token: Option
                                         response_text += chunk_text
                                         await safe_send({"type": "response.text_partial", "text": chunk_text})
 
+                                llm_duration = (time.perf_counter() - llm_start) * 1000
+                                metrics.record_latency("llm_response", llm_duration)
+
                                 logger.info(f"Agent reply complete: {len(response_text)} chars.")
                                 if not response_text.strip():
                                     response_text = "I'm sorry, I couldn't process that. Please try again."
                                     await safe_send({"type": "response.text_partial", "text": response_text})
                                 await safe_send({"type": "response.text", "text": response_text})
+                                await safe_send({"type": "response.complete"})
                                 
                                 # Save Bot response to DB
                                 if db_user_id:
@@ -840,6 +999,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str, token: Option
                                         "type": "error",
                                         "message": "Our analysis engine is temporarily unavailable. Please try again in a moment."
                                     })
+                                    await safe_send({"type": "response.complete"})
 
                             except Exception as e:
                                 err_msg = str(e)
@@ -850,10 +1010,12 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str, token: Option
                                 if is_429:
                                     logger.error(f"❌ Gemini Quota Exceeded (429): {err_msg}")
                                     await safe_send({"type": "error", "message": "I've hit my daily limit for analysis. Please try again tomorrow or upgrade your Gemini API key plan."})
+                                    await safe_send({"type": "response.complete"})
                                     break
                                 elif is_401:
                                     logger.error(f"❌ Gemini API Key Error (401): {err_msg}")
                                     await safe_send({"type": "error", "message": "My API key seems to be invalid. Please check the .env file and ensure your Google AI Studio key is correct."})
+                                    await safe_send({"type": "response.complete"})
                                     break
                                 elif is_503 and attempt < max_retries:
                                     wait_time = attempt * 5
@@ -868,6 +1030,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str, token: Option
                                 else:
                                     logger.error(f"Unhandled Agent error: {err_msg}", exc_info=True)
                                     await websocket.send_json({"type": "error", "message": "An unexpected error occurred. Please refresh and try again."})
+                                    await safe_send({"type": "response.complete"})
                                     break
                     except WebSocketDisconnect:
                         logger.info(f"Client {client_id} disconnected during agent execution.")
@@ -946,7 +1109,8 @@ def get_admin_stats(db: Session = Depends(get_db), current_admin: AdminUser = De
         "total_users": total_users,
         "total_sessions": total_sessions,
         "total_messages": total_messages,
-        "total_documents": total_documents 
+        "total_documents": total_documents,
+        "performance": metrics.get_summary()
     }
 
 @app.get("/api/admin/users")
